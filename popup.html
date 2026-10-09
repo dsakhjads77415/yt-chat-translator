@@ -64,6 +64,12 @@
     <select id="geminiModel"><option value="">연결 테스트를 누르면 목록이 채워집니다</option></select>
     <button id="testGemini" type="button">저장 + 연결 테스트</button><span class="msg" id="geminiMsg"></span>
     <div class="hint" style="margin-top:4px">Gemini가 한도 초과·오류일 때는 자동으로 구글 번역을 씁니다. 키는 이 PC의 크롬에만 저장됩니다.</div>
+    <div class="label" style="margin-top:8px">내 무료 한도 <span class="hint">— AI Studio → 사용량(Usage)·한도(Rate limit)에서 지금 고른 모델 값을 확인해 넣기</span></div>
+    <div class="keyrow">
+      <label style="flex:1">분당 요청 <input type="text" id="gemRpm" inputmode="numeric" style="width:60px"></label>
+      <label style="flex:1">하루 요청 <input type="text" id="gemRpd" inputmode="numeric" style="width:70px"></label>
+    </div>
+    <div class="hint">음성 자막은 이 한도의 80%까지만 Gemini를 쓰고, 넘으면 구글 번역으로 바꿉니다(나머지 20%는 채팅 번역 몫). 하루 한도는 미국 서부 시간 자정(한국 오후 4~5시)에 초기화됩니다.</div>
     <details>
       <summary>API 키 발급 방법 (무료, 카드 불필요)</summary>
       <ol>
@@ -92,6 +98,24 @@
 </section>
 
 <section>
+  <div class="label">방송 음성 자막 (일본어 → 한국어)</div>
+  <button id="sttBtn" type="button">이 탭 자막 시작</button><span class="msg" id="sttMsg"></span>
+  <div class="hint" id="sttDiag" style="margin-top:4px"></div>
+  <div class="label" style="margin-top:8px">음성 인식 모델</div>
+  <select id="sttModel">
+    <option value="auto">자동 (그래픽카드에 맞춰 고름)</option>
+    <option value="turbo">정확 — large-v3-turbo (처음 1GB 안팎 내려받음)</option>
+    <option value="small">보통 — small (수백 MB)</option>
+    <option value="base">가벼움 — base (그래픽카드 없이 · 덜 정확)</option>
+  </select>
+  <label class="row"><input type="checkbox" id="sttShowJa"> 일본어 원문도 같이 보기</label>
+  <div class="row" style="cursor:default">글자 크기
+    <select id="sttSize" style="width:auto"><option value="18">작게</option><option value="22">보통</option><option value="26">크게</option><option value="30">아주 크게</option></select>
+  </div>
+  <div class="hint">YouTube 방송 탭에서 이 창을 열고 누르세요. 모델은 처음 한 번만 내려받고(가입 필요 없음) 다음부터는 바로 켜집니다. 자막 번역은 구글 번역을 씁니다.</div>
+</section>
+
+<section>
   <div class="label">사용자 사전 <span class="hint">— 한 줄에 하나씩 <code>원문=번역</code></span></div>
   <textarea id="userDict" spellcheck="false" placeholder="ダンバートン=던바튼&#10;あもちゃん=아모짱"></textarea>
   <button id="save" type="button">사전 저장</button><span class="msg" id="savedMsg"></span>
@@ -102,6 +126,7 @@
   <div class="stats">
     <span>처리한 메시지</span><b id="sMsg">-</b>
     <span>Gemini 요청 / 오류</span><b id="sG">-</b>
+    <span>Gemini 한도 사용 (분당 · 오늘)</span><b id="sGU">-</b>
     <span>구글로 대체된 메시지</span><b id="sFb">-</b>
     <span>구글 요청 / 오류</span><b id="sReq">-</b>
   </div>

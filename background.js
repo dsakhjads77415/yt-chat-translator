@@ -21,7 +21,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- 설정 ----------
 async function getCfg() {
-  const local = await chrome.storage.local.get({ engine: 'google', geminiKey: '', geminiModel: '' });
+  const local = await chrome.storage.local.get({ engine: 'google', geminiKey: '', geminiModel: '', gemRpm: 15, gemRpd: 500 });
   const sync = await chrome.storage.sync.get({ userDict: '' });
   return Object.assign(local, sync);
 }
@@ -164,6 +164,27 @@ Rules:
 - The stream may be about the game Mabinogi Mobile; use the glossary below for its terms when they appear.
 - If a message is already Korean or cannot be translated, return it unchanged.`;
 
+// 10-09 소닉 '음성 자막도 Gemini 로, 한도의 80% 가 차면 구글로 (100% 면 채팅까지 구글로 넘어가니까)':
+// Gemini 무료 한도는 계정·모델마다 달라 API 로 알 수 없음 → AI Studio 에서 본 값을 설정에 넣고, 보낸 요청을 직접 셈
+// (분당: 최근 60초 · 하루: 미국 태평양 시간 자정에 초기화 — 구글 기준)
+const gemMin = []; // 최근 요청 시각
+function ptDate() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+}
+async function gemUseNote() {
+  const { gemDay } = await chrome.storage.local.get('gemDay');
+  let d = gemDay && gemDay.date === ptDate() ? gemDay : { date: ptDate(), n: 0 };
+  d.n++;
+  await chrome.storage.local.set({ gemDay: d });
+  gemMin.push(Date.now());
+}
+async function gemUsage() {
+  const now = Date.now();
+  while (gemMin.length && now - gemMin[0] > 60000) gemMin.shift();
+  const { gemDay } = await chrome.storage.local.get('gemDay');
+  return { min: gemMin.length, day: gemDay && gemDay.date === ptDate() ? gemDay.n : 0 };
+}
+
 let gLastAt = 0;
 let gCooldownUntil = 0;
 let gCooldownMs = 0;
@@ -202,8 +223,13 @@ function setGeminiError(st, msg, cooldownMs) {
   saveStats();
 }
 
+// 시스템 프롬프트를 직접 주는 판(음성 자막용) — 같은 줄(gChain)에서, 4초 간격은 안 기다림
+function geminiCallRaw(texts, cfg, sys) {
+  return geminiCall(texts, cfg, { paced: false, sys });
+}
+
 // 성공 시 번역 배열, 실패 시 null
-async function geminiCall(texts, cfg, { paced = true, out = false } = {}) {
+async function geminiCall(texts, cfg, { paced = true, out = false, sys = null } = {}) {
   const run = async () => {
     const st = await loadStats();
     if (paced) {
@@ -212,8 +238,9 @@ async function geminiCall(texts, cfg, { paced = true, out = false } = {}) {
     }
     gLastAt = Date.now();
     st.gRequests++;
+    await gemUseNote();
     const body = {
-      systemInstruction: { parts: [{ text: (out ? OUT_PROMPT : SYSTEM_PROMPT) + glossaryFor(texts, cfg.userDict, out) }] },
+      systemInstruction: { parts: [{ text: sys || (out ? OUT_PROMPT : SYSTEM_PROMPT) + glossaryFor(texts, cfg.userDict, out) }] },
       contents: [{ role: 'user', parts: [{ text: JSON.stringify(texts) }] }],
       generationConfig: {
         temperature: 0.2,
@@ -380,6 +407,139 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     });
     return true;
   }
+});
+
+// =====================================================================
+// 방송 음성 → 한글 자막 (offscreen 문서에서 Whisper 로 일본어를 글자로 → 여기서 번역 → 방송 탭에 표시)
+// =====================================================================
+const STT = { tabId: null, state: 'off', text: '', model: '' };
+let offUp = null; // offscreen 문서가 메시지를 받을 준비가 됐는지
+chrome.storage.session.get('stt').then((r) => { if (r && r.stt) Object.assign(STT, r.stt); }).catch(() => {}); // 서비스 워커가 다시 깨어날 때
+
+async function ensureOffscreen() {
+  const has = chrome.offscreen.hasDocument ? await chrome.offscreen.hasDocument() : false;
+  if (has) return;
+  const ready = new Promise((res) => { offUp = res; setTimeout(res, 20000); });
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['USER_MEDIA'],
+    justification: '방송 탭 소리를 받아 일본어 음성을 한글 자막으로 바꿉니다',
+  });
+  await ready; // 엔진 파일(큰 자바스크립트)을 다 읽고 메시지를 받을 수 있을 때까지
+}
+
+function sttSave() {
+  chrome.storage.session.set({ stt: STT }).catch(() => {});
+}
+
+function toTab(tabId, msg) {
+  if (tabId == null) return;
+  chrome.tabs.sendMessage(tabId, msg).catch(() => {});
+}
+
+const STT_PROMPT = `You translate Japanese speech from a live streamer (Japanese VTuber / game streamer) into natural Korean subtitles.
+Rules:
+- Input: a JSON array with ONE Japanese line produced by speech recognition (it may contain recognition errors). Output: a JSON array with ONE Korean string.
+- Natural spoken Korean that a Korean viewer would read as a subtitle; keep the streamer's casual tone; short and clear. No explanations or notes.
+- If a word looks misrecognized, translate the most likely intended meaning.
+- The stream may be about the game Mabinogi Mobile; use the glossary below for its terms when they appear.`;
+const sttCtx = []; // 앞 문장(맥락용)
+
+async function geminiStt(ja, cfg) {
+  if (!(cfg.engine === 'gemini' && cfg.geminiKey && cfg.geminiModel)) return null;
+  if (Date.now() < gCooldownUntil) return null;
+  const u = await gemUsage();
+  const rpm = Math.max(1, Number(cfg.gemRpm) || 15);
+  const rpd = Math.max(1, Number(cfg.gemRpd) || 500);
+  if (u.min >= rpm * 0.8 || u.day >= rpd * 0.8) {
+    STT.gemNote = `자막은 구글 번역 (Gemini 한도 80% — 분당 ${u.min}/${rpm} · 오늘 ${u.day}/${rpd})`;
+    return null;
+  }
+  const ctx = sttCtx.length ? '\n\nPrevious lines (context only, do not translate): ' + sttCtx.join(' / ') : '';
+  const r = await geminiCallRaw([ja], cfg, STT_PROMPT + glossaryFor([ja], cfg.userDict, false) + ctx);
+  STT.gemNote = `자막은 Gemini (분당 ${u.min + 1}/${rpm} · 오늘 ${u.day + 1}/${rpd})`;
+  return r && r[0] ? r[0] : null;
+}
+
+async function translateStt(ja) {
+  const cfg = await getCfg();
+  sttCtx.push(ja);
+  while (sttCtx.length > 3) sttCtx.shift();
+  const g = await geminiStt(ja, cfg).catch(() => null);
+  if (g) return { ko: g, engine: 'gemini' };
+  const userMap = D.parseUserDict ? D.parseUserDict(cfg.userDict) : {};
+  const p = D.prepare ? D.prepare(ja, userMap) : { send: ja, sl: 'ja' };
+  if (p.local) return { ko: p.local, engine: 'dict' };
+  const out = [null];
+  await googleItems([{ t: p.send || ja, sl: 'ja' }], [0], out);
+  if (!out[0]) return null;
+  return { ko: out[0].text + (p.suffix ? ' ' + p.suffix : ''), engine: 'google' };
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || msg.target === 'offscreen') return;
+  if (msg.type === 'offscreen-up') {
+    if (offUp) { offUp(); offUp = null; }
+    return;
+  }
+  if (msg.type === 'stt-start') {
+    (async () => {
+      try {
+        if (STT.tabId != null && STT.tabId !== msg.tabId) toTab(STT.tabId, { type: 'stt-status', state: 'off', text: '' });
+        Object.assign(STT, { tabId: msg.tabId, state: 'loading', text: '준비 중…' });
+        sttSave();
+        toTab(msg.tabId, { type: 'stt-status', state: 'loading', text: '자막 준비 중…' });
+        await ensureOffscreen();
+        chrome.runtime.sendMessage({ target: 'offscreen', type: 'start', tabId: msg.tabId, streamId: msg.streamId, model: msg.model || 'auto' }).catch(() => {});
+        sendResponse({ ok: true });
+      } catch (e) {
+        Object.assign(STT, { state: 'error', text: String(e.message || e) });
+        sttSave();
+        sendResponse({ ok: false, error: String(e.message || e) });
+      }
+    })();
+    return true;
+  }
+  if (msg.type === 'stt-stop') {
+    chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop' }).catch(() => {});
+    toTab(STT.tabId, { type: 'stt-status', state: 'off', text: '' });
+    Object.assign(STT, { state: 'off', text: '자막 꺼짐' });
+    sttSave();
+    sendResponse({ ok: true });
+    return;
+  }
+  if (msg.type === 'stt-get') {
+    sendResponse(Object.assign({}, STT));
+    return;
+  }
+  if (msg.type === 'gem-usage') {
+    Promise.all([gemUsage(), getCfg()]).then(([u, cfg]) => sendResponse(Object.assign(u, { rpm: cfg.gemRpm, rpd: cfg.gemRpd })));
+    return true;
+  }
+  if (msg.type === 'stt-status' && msg.state === 'diag') {
+    STT.diag = msg.text || '';
+    sttSave();
+    return;
+  }
+  if (msg.type === 'stt-status') {
+    if (msg.state !== 'on') STT.diag = '';
+    Object.assign(STT, { state: msg.state, text: msg.text || '' }, msg.model ? { model: msg.model } : {});
+    if (msg.state === 'off') STT.tabId = null;
+    sttSave();
+    toTab(msg.tabId != null ? msg.tabId : STT.tabId, { type: 'stt-status', state: msg.state, text: msg.text || '' });
+    return;
+  }
+  if (msg.type === 'stt-text') {
+    translateStt(msg.ja).then((r) => {
+      toTab(msg.tabId, { type: 'stt-sub', ja: msg.ja, ko: r ? r.ko : '', engine: r && r.engine, lagMs: msg.lagMs, asrMs: msg.asrMs });
+    });
+    return;
+  }
+});
+
+// 자막을 켠 탭을 닫으면 끔
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === STT.tabId) chrome.runtime.sendMessage({ target: 'offscreen', type: 'stop' }).catch(() => {});
 });
 
 // 테스트용 export (확장 프로그램에서는 무시됨)

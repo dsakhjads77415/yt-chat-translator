@@ -1,6 +1,6 @@
 // 표시·사전 설정은 sync, 엔진·키는 이 PC에만 (local)
 const SYNC_DEFAULTS = { enabled: true, mode: 'replace', otherLangs: false, userDict: '', outEnabled: true };
-const LOCAL_DEFAULTS = { engine: 'google', geminiKey: '', geminiModel: '', geminiModels: [] };
+const LOCAL_DEFAULTS = { engine: 'google', geminiKey: '', geminiModel: '', geminiModels: [], gemRpm: 15, gemRpd: 500 };
 const $ = (id) => document.getElementById(id);
 const send = (msg) => new Promise((res) => chrome.runtime.sendMessage(msg, (r) => res(chrome.runtime.lastError ? null : r)));
 
@@ -42,6 +42,8 @@ chrome.storage.local.get(LOCAL_DEFAULTS, (s) => {
   if (r) r.checked = true;
   showEngine(s.engine);
   $('geminiKey').value = s.geminiKey;
+  $('gemRpm').value = s.gemRpm;
+  $('gemRpd').value = s.gemRpd;
   fillModels(s.geminiModels || [], s.geminiModel);
 });
 
@@ -57,6 +59,13 @@ document.querySelectorAll('input[name="engine"]').forEach((r) =>
     showEngine(e.target.value);
   })
 );
+for (const id of ['gemRpm', 'gemRpd']) {
+  $(id).addEventListener('change', (e) => {
+    const v = parseInt(String(e.target.value).replace(/[^0-9]/g, ''), 10);
+    if (v > 0) chrome.storage.local.set({ [id]: v });
+    else chrome.storage.local.get(LOCAL_DEFAULTS, (s) => (e.target.value = s[id]));
+  });
+}
 $('geminiModel').addEventListener('change', (e) => chrome.storage.local.set({ geminiModel: e.target.value }));
 $('toggleKey').addEventListener('click', () => {
   const k = $('geminiKey');
@@ -110,6 +119,8 @@ async function showStats() {
   $('sMsg').textContent = n(s.messages);
   $('sG').textContent = `${n(s.gRequests)} / ${n(s.gErrors)}`;
   $('sFb').textContent = n(s.gFallback);
+  const u = await send({ type: 'gem-usage' });
+  if (u) $('sGU').textContent = `${u.min}/${u.rpm} · ${u.day}/${u.rpd}`;
   $('sReq').textContent = `${n(s.requests)} / ${n(s.errors)}`;
   const lines = [];
   const gWait = Math.ceil(((s.gCooldownUntil || 0) - Date.now()) / 1000);
@@ -123,3 +134,58 @@ async function showStats() {
 }
 showStats();
 setInterval(showStats, 2000);
+
+// ---------------------------------------------------------------- 방송 음성 자막
+const STT_SYNC = { sttModel: 'auto', sttShowJa: true, sttSize: 22 };
+let sttHere = false;
+
+chrome.storage.sync.get(STT_SYNC, (s) => {
+  $('sttModel').value = s.sttModel;
+  $('sttShowJa').checked = s.sttShowJa;
+  $('sttSize').value = String(s.sttSize);
+});
+$('sttModel').addEventListener('change', (e) => chrome.storage.sync.set({ sttModel: e.target.value }));
+$('sttShowJa').addEventListener('change', (e) => chrome.storage.sync.set({ sttShowJa: e.target.checked }));
+$('sttSize').addEventListener('change', (e) => chrome.storage.sync.set({ sttSize: parseInt(e.target.value, 10) }));
+
+async function activeTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function sttRefresh() {
+  const s = await send({ type: 'stt-get' });
+  const tab = await activeTab();
+  sttHere = !!(s && tab && s.tabId === tab.id && s.state !== 'off' && s.state !== 'error');
+  $('sttBtn').textContent = sttHere ? '자막 끄기' : '이 탭 자막 시작';
+  const cls = s && s.state === 'error' ? 'bad' : s && s.state === 'on' ? 'ok' : '';
+  setMsg($('sttMsg'), (s && s.state !== 'off' && (sttHere || s.state === 'error')) ? s.text : '', cls);
+  $('sttDiag').textContent = sttHere ? [s.gemNote, s.diag].filter(Boolean).join('\n') : '';
+  $('sttDiag').style.whiteSpace = 'pre-line';
+}
+
+$('sttBtn').addEventListener('click', async () => {
+  if (sttHere) {
+    await send({ type: 'stt-stop' });
+    return sttRefresh();
+  }
+  const tab = await activeTab();
+  if (!tab || !/^https:\/\/www\.youtube\.com\//.test(tab.url || '')) {
+    return setMsg($('sttMsg'), 'YouTube 방송 탭에서 눌러 주세요', 'bad');
+  }
+  setMsg($('sttMsg'), '시작하는 중…');
+  chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id }, async (streamId) => {
+    if (chrome.runtime.lastError || !streamId) {
+      return setMsg($('sttMsg'), '탭 소리를 못 잡음: ' + (chrome.runtime.lastError ? chrome.runtime.lastError.message : '알 수 없음'), 'bad');
+    }
+    const r = await send({ type: 'stt-start', tabId: tab.id, streamId, model: $('sttModel').value });
+    if (!r || !r.ok) setMsg($('sttMsg'), '시작 실패: ' + ((r && r.error) || '알 수 없음'), 'bad');
+    sttRefresh();
+  });
+});
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === 'stt-status' && msg.state !== 'diag') setTimeout(sttRefresh, 50);
+});
+sttRefresh();
+setInterval(sttRefresh, 1500);
