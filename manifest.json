@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube 채팅 번역기 (일→한)",
+  "version": "1.1.0",
+  "description": "YouTube 라이브 채팅의 일본어 메시지를 한국어로 실시간 번역하고, 내 한국어 채팅을 일본어로 바꿔 보냅니다.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://translate.googleapis.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/live_chat*",
+        "https://www.youtube.com/live_chat_replay*"
+      ],
+      "js": ["dict.js", "content.js"],
+      "css": ["content.css"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "YouTube 채팅 번역기",
+    "default_popup": "popup.html"
+  }
+}
